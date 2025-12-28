@@ -57,19 +57,3 @@ The MCP server will be available at `http://localhost:8000/mcp`
 | `send_message` | Send a message |
 | `send_dm` | DM a user by username |
 | `react_to_message` | React with an emoji |
-
-## Troubleshooting
-
-### "Instagram cookies not set"
-Make sure your `.env` file has at least:
-```
-IG_SESSION_ID=...
-IG_USER_ID=...
-IG_CSRF_TOKEN=...
-```
-
-### "Gateway binary not found"
-Build it first: `cd gateway && ./build.sh`
-
-### Session expired
-Get fresh cookies from instagram.com and update your `.env`
