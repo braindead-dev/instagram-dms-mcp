@@ -15,41 +15,38 @@ A Model Context Protocol (MCP) server that lets AI assistants read and send Inst
 
 ### 1. Get Your Instagram Cookies
 
-Go to [instagram.com](https://www.instagram.com) and log in, then open the browser console (F12 or Cmd+Option+I) and run:
+Go to [instagram.com](https://www.instagram.com) and log in, then:
+
+1. Open DevTools (F12 or Cmd+Option+I)
+2. Go to **Application** tab → **Cookies** → `https://www.instagram.com`
+3. Find and copy these cookie values:
+
+| Cookie | Required |
+|--------|----------|
+| `sessionid` | ✅ Yes |
+| `ds_user_id` | ✅ Yes |
+| `csrftoken` | ✅ Yes |
+| `datr` | Optional |
+| `ig_did` | Optional |
+| `mid` | Optional |
+
+4. Paste into console to generate JSON (replace with YOUR values):
 
 ```javascript
-// Copy this entire script and paste it into the browser console
-(function() {
-    const cookies = {};
-    document.cookie.split(';').forEach(c => {
-        const [key, val] = c.trim().split('=');
-        if (key && val) cookies[key] = decodeURIComponent(val);
-    });
-    
-    // These are the essential cookies needed
-    const needed = ['sessionid', 'ds_user_id', 'csrftoken', 'ig_did', 'mid', 'datr', 'ig_nrcb'];
-    const result = {};
-    
-    needed.forEach(k => {
-        if (cookies[k]) result[k] = cookies[k];
-    });
-    
-    // Check if we have the essential ones
-    if (!result.sessionid || !result.ds_user_id) {
-        console.error('❌ Missing essential cookies. Make sure you are logged in!');
-        return;
-    }
-    
-    const json = JSON.stringify(result, null, 2);
-    console.log('✅ Copy this JSON to ~/.instagram-dms-mcp/cookies.json:\n\n' + json);
-    
-    // Also copy to clipboard if possible
-    try {
-        navigator.clipboard.writeText(json);
-        console.log('\n📋 (Already copied to clipboard!)');
-    } catch(e) {}
-})();
+// Replace the values below with your actual cookie values from the Application tab
+copy(JSON.stringify({
+  "sessionid": "YOUR_SESSIONID_HERE",
+  "ds_user_id": "YOUR_DS_USER_ID_HERE",
+  "csrftoken": "YOUR_CSRFTOKEN_HERE",
+  "datr": "YOUR_DATR_HERE",
+  "ig_did": "YOUR_IG_DID_HERE",
+  "mid": "YOUR_MID_HERE"
+}, null, 2))
 ```
+
+This copies the JSON to your clipboard.
+
+> **Why manual?** Instagram marks `sessionid` as HttpOnly, so JavaScript can't read it directly. You need to copy it from the Application tab.
 
 ### 2. Save Your Cookies
 
