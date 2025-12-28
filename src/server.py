@@ -338,7 +338,8 @@ async def poll_incoming_messages():
         try:
             result = await gateway_get("/poll", {"max": "50"})
             if result.get("ok"):
-                events = result.get("data", {}).get("events", [])
+                data = result.get("data") or {}
+                events = data.get("events") or []
                 for event in events:
                     sender_id = event.get("sender_id", "")
                     
