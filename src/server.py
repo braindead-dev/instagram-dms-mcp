@@ -26,6 +26,37 @@ from fastmcp import FastMCP
 
 load_dotenv()
 
+
+# Logging
+def log(event_type: str, message: str, data: dict | None = None):
+    """Simple event logger for observability."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    # Color codes
+    colors = {
+        "incoming": "\033[94m",  # Blue - incoming DMs
+        "outgoing": "\033[92m",  # Green - outgoing messages
+        "poke": "\033[95m",      # Magenta - Poke webhook
+        "tool": "\033[93m",      # Yellow - MCP tool calls
+        "error": "\033[91m",     # Red - errors
+    }
+    reset = "\033[0m"
+    color = colors.get(event_type, "")
+    
+    prefix = {
+        "incoming": "[IN]",
+        "outgoing": "[OUT]", 
+        "poke": "🌴 POKE",
+        "tool": "🔧 MCP",
+        "error": "❌ ERR",
+    }.get(event_type, "•")
+    
+    print(f"{color}[{timestamp}] {prefix}: {message}{reset}")
+    if data:
+        for k, v in data.items():
+            print(f"{color}         {k}: {v}{reset}")
+
+
 # Configuration
 GATEWAY_PORT = 29391
 GATEWAY_URL = f"http://127.0.0.1:{GATEWAY_PORT}"
@@ -296,20 +327,37 @@ async def _send_typing(thread_id: str):
         await gateway_post("/typing", {"thread_id": thread_id, "typing": False})
 
 
-async def notify_poke(sender_username: str, sender_name: str, text: str, attachments: list):
+async def notify_poke(sender_username: str, sender_name: str, thread_id: str, text: str, attachments: list):
     """Send incoming DM notification to Poke."""
     if not POKE_API_KEY:
         return
     
-    # Format the message nicely
-    sender = f"@{sender_username}" if sender_username else sender_name or "Someone"
+    # Format sender: @username (Display Name)
+    if sender_username and sender_name:
+        sender = f"@{sender_username} ({sender_name})"
+    elif sender_username:
+        sender = f"@{sender_username}"
+    elif sender_name:
+        sender = sender_name
+    else:
+        sender = "Someone"
     
     # Handle attachments
     if attachments and not text:
-        att_types = [a.get("type", "attachment") for a in attachments]
+        att_types = []
+        for a in attachments:
+            att_type = a.get("type", "")
+            if att_type in ("1", "2", "image"):
+                att_types.append("photo")
+            elif att_type in ("3", "4", "video"):
+                att_types.append("video")
+            elif att_type == "6" or "audio" in str(att_type).lower():
+                att_types.append("voice message")
+            else:
+                att_types.append("attachment")
         text = f"[sent {', '.join(att_types)}]"
     
-    message = f"📩 Instagram DM from {sender}: {text}"
+    message = f"Instagram DM from {sender} [thread:{thread_id}]: {text}"
     
     try:
         async with httpx.AsyncClient() as client:
@@ -322,8 +370,9 @@ async def notify_poke(sender_username: str, sender_name: str, text: str, attachm
                 json={"message": message},
                 timeout=10,
             )
+        log("poke", f"Forwarded DM to Poke", {"from": sender, "thread": thread_id})
     except Exception as e:
-        print(f"Failed to notify Poke: {e}")
+        log("error", f"Failed to notify Poke: {e}")
 
 
 async def poll_incoming_messages():
@@ -342,6 +391,7 @@ async def poll_incoming_messages():
                 events = data.get("events") or []
                 for event in events:
                     sender_id = event.get("sender_id", "")
+                    thread_id = event.get("thread_id", "")
                     
                     # Skip our own messages
                     if sender_id == _self_user_id:
@@ -349,10 +399,17 @@ async def poll_incoming_messages():
                     
                     # Get sender info
                     user_info = await get_user_info(sender_id)
+                    username = user_info.get("username", "")
+                    
+                    log("incoming", f"New DM from @{username or sender_id}", {
+                        "thread": thread_id,
+                        "message": event.get("text", "")[:50] + ("..." if len(event.get("text", "")) > 50 else "")
+                    })
                     
                     await notify_poke(
                         sender_username=user_info.get("username", ""),
                         sender_name=user_info.get("name", ""),
+                        thread_id=thread_id,
                         text=event.get("text", ""),
                         attachments=event.get("attachments", []),
                     )
@@ -370,6 +427,7 @@ async def get_inbox() -> dict:
     View your Instagram inbox with all conversations.
     Shows who messaged you, the last message preview, and when.
     """
+    log("tool", "get_inbox() called")
     result = await gateway_get("/threads")
     if not result.get("ok"):
         return {"error": result.get("error", "Failed to load inbox")}
@@ -415,6 +473,7 @@ async def get_conversation(user: str, limit: int = 20) -> dict:
         user: Username (like "johndoe" or "@johndoe") or thread_id
         limit: Number of recent messages to show (default 20)
     """
+    log("tool", f"get_conversation({user})")
     thread_id = await resolve_thread_id(user)
     if not thread_id:
         return {"error": f"Could not find conversation with '{user}'"}
@@ -490,6 +549,8 @@ async def send_message(user: str, message: str) -> dict:
         user: Username (like "johndoe" or "@johndoe") or thread_id
         message: The message to send
     """
+    log("tool", f"send_message({user})", {"message": message[:50] + ("..." if len(message) > 50 else "")})
+    
     if not message:
         return {"error": "Message cannot be empty"}
     
@@ -499,6 +560,7 @@ async def send_message(user: str, message: str) -> dict:
         username = user.lstrip("@")
         result = await gateway_post("/dm_username", {"username": username, "text": message})
         if result.get("ok"):
+            log("outgoing", f"Sent DM to @{username} (new conversation)")
             return {"sent": True, "to": f"@{username}", "message": message}
         return {"error": f"Could not find or message '{user}'"}
     
@@ -514,6 +576,7 @@ async def send_message(user: str, message: str) -> dict:
     partner_info = _user_cache.get(thread_id, {})
     recipient = f"@{partner_info.get('username', '')}" if partner_info.get("username") else user
     
+    log("outgoing", f"Sent message to {recipient}", {"thread": thread_id})
     return {"sent": True, "to": recipient, "message": message}
 
 
@@ -527,6 +590,7 @@ async def react(user: str, emoji: str, message_id: Optional[str] = None) -> dict
         emoji: The emoji to react with (like "❤️" or "😂")
         message_id: Specific message ID to react to (if not provided, reacts to the last message from them)
     """
+    log("tool", f"react({user}, {emoji})")
     thread_id = await resolve_thread_id(user)
     if not thread_id:
         return {"error": f"Could not find conversation with '{user}'"}
@@ -556,6 +620,7 @@ async def react(user: str, emoji: str, message_id: Optional[str] = None) -> dict
     if not result.get("ok"):
         return {"error": result.get("error", "Failed to react")}
     
+    log("outgoing", f"Reacted with {emoji} to message in {user}")
     return {"reacted": True, "emoji": emoji}
 
 
