@@ -73,11 +73,3 @@ Build it first: `cd gateway && ./build.sh`
 
 ### Session expired
 Get fresh cookies from instagram.com and update your `.env`
-
-## Security
-
-⚠️ Your `.env` contains your Instagram session. Never commit it to git.
-
-## License
-
-MIT
