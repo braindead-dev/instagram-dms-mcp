@@ -22,7 +22,7 @@ A Model Context Protocol (MCP) server that lets AI assistants read and send Inst
 ### 2. Setup
 
 ```bash
-git clone https://github.com/anthropics/instagram-dms-mcp.git
+git clone https://github.com/braindead-dev/instagram-dms-mcp.git
 cd instagram-dms-mcp
 
 # Build the gateway (requires Go 1.22+)
