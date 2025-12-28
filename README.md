@@ -19,8 +19,6 @@ A Model Context Protocol (MCP) server that lets AI assistants read and send Inst
 | `ig_did` | `IG_DID` |
 | `mid` | `IG_MID` |
 
-> **Note:** `sessionid` is marked HttpOnly so you must copy it manually from the Application tab.
-
 ### 2. Setup
 
 ```bash
