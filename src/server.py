@@ -26,20 +26,34 @@ from fastmcp import FastMCP
 
 load_dotenv()
 
-# Gateway configuration
+# Configuration
 GATEWAY_PORT = 29391
 GATEWAY_URL = f"http://127.0.0.1:{GATEWAY_PORT}"
 
-# Global gateway process
+# Behavior settings
+SIMULATE_TYPING = os.getenv("IG_SIMULATE_TYPING", "true").lower() == "true"
+AUTO_MARK_SEEN = os.getenv("IG_AUTO_MARK_SEEN", "true").lower() == "true"
+TYPING_DELAY_SECONDS = float(os.getenv("IG_TYPING_DELAY", "1.5"))
+
+# Poke webhook for incoming DM notifications
+POKE_API_KEY = os.getenv("POKE_API_KEY", "")
+
+# Global state
 _gateway_process: Optional[subprocess.Popen] = None
 _cookies_tempfile: Optional[str] = None
+_poll_task: Optional[asyncio.Task] = None
+_self_user_id: Optional[str] = None
+_self_username: Optional[str] = None
+
+# User cache: user_id -> {username, name}
+_user_cache: dict[str, dict] = {}
 
 mcp = FastMCP("instagram-dms-mcp")
 
 
+# Gateway Management
 def get_cookies_json() -> Optional[str]:
     """Get cookies JSON from environment variables."""
-    # Try individual env vars first (preferred method)
     session_id = os.getenv("IG_SESSION_ID", "")
     user_id = os.getenv("IG_USER_ID", "")
     csrf_token = os.getenv("IG_CSRF_TOKEN", "")
@@ -50,7 +64,6 @@ def get_cookies_json() -> Optional[str]:
             "ds_user_id": user_id,
             "csrftoken": csrf_token,
         }
-        # Add optional cookies if present
         if os.getenv("IG_DATR"):
             cookies["datr"] = os.getenv("IG_DATR")
         if os.getenv("IG_DID"):
@@ -59,18 +72,15 @@ def get_cookies_json() -> Optional[str]:
             cookies["mid"] = os.getenv("IG_MID")
         return json.dumps(cookies)
     
-    # Fallback: try IG_COOKIES as JSON or base64
+    # Fallback: IG_COOKIES as JSON or base64
     cookies_raw = os.getenv("IG_COOKIES", "")
     if cookies_raw:
-        # Try to decode as base64 first
         try:
             decoded = base64.b64decode(cookies_raw).decode("utf-8")
-            json.loads(decoded)  # Verify it's valid JSON
+            json.loads(decoded)
             return decoded
         except Exception:
             pass
-        
-        # Try as raw JSON
         try:
             json.loads(cookies_raw)
             return cookies_raw
@@ -81,7 +91,7 @@ def get_cookies_json() -> Optional[str]:
 
 
 def find_gateway_binary() -> Optional[Path]:
-    """Find the gateway binary relative to this script."""
+    """Find the gateway binary."""
     script_dir = Path(__file__).parent.parent
     candidates = [
         script_dir / "gateway" / "ig-gateway",
@@ -96,41 +106,39 @@ def find_gateway_binary() -> Optional[Path]:
 
 def start_gateway() -> bool:
     """Start the Instagram gateway as a subprocess."""
-    global _gateway_process, _cookies_tempfile
+    global _gateway_process, _cookies_tempfile, _self_user_id, _self_username
     
     # Check if already running
     try:
         resp = httpx.get(f"{GATEWAY_URL}/health", timeout=2)
         if resp.status_code == 200:
-            print("Gateway already running")
+            data = resp.json()
+            _self_user_id = data.get("user_id")
+            _self_username = data.get("username")
+            print(f"Gateway already running - logged in as @{_self_username}")
             return True
     except Exception:
         pass
     
-    # Get cookies
     cookies_json = get_cookies_json()
     if not cookies_json:
         print("ERROR: Instagram cookies not set")
-        print("Set these environment variables in your .env file:")
+        print("Set these in your .env file:")
         print("  IG_SESSION_ID=...")
         print("  IG_USER_ID=...")
         print("  IG_CSRF_TOKEN=...")
-        print("\nSee env.example for the full list")
         return False
     
-    # Write cookies to temp file
     fd, _cookies_tempfile = tempfile.mkstemp(suffix=".json", prefix="ig_cookies_")
     with os.fdopen(fd, "w") as f:
         f.write(cookies_json)
     
-    # Find gateway binary
     gateway_bin = find_gateway_binary()
     if not gateway_bin:
-        print("ERROR: Gateway binary not found. Run 'cd gateway && ./build.sh' first")
+        print("ERROR: Gateway not found. Run: cd gateway && ./build.sh")
         return False
     
-    # Start gateway
-    print(f"Starting Instagram gateway...")
+    print("Starting Instagram gateway...")
     env = os.environ.copy()
     env["IG_COOKIES_FILE"] = _cookies_tempfile
     
@@ -141,32 +149,36 @@ def start_gateway() -> bool:
         stderr=subprocess.STDOUT,
     )
     
-    # Wait for gateway to be ready
-    for i in range(30):
+    for _ in range(30):
         try:
             resp = httpx.get(f"{GATEWAY_URL}/health", timeout=2)
             if resp.status_code == 200:
                 data = resp.json()
-                print(f"Gateway ready - logged in as @{data.get('username', 'unknown')}")
+                _self_user_id = data.get("user_id")
+                _self_username = data.get("username")
+                print(f"Gateway ready - logged in as @{_self_username}")
                 return True
         except Exception:
             pass
         
-        # Check if process died
         if _gateway_process.poll() is not None:
             stdout, _ = _gateway_process.communicate()
-            print(f"Gateway failed to start:\n{stdout.decode()}")
+            print(f"Gateway failed:\n{stdout.decode()}")
             return False
         
         time.sleep(1)
     
-    print("Gateway timed out waiting for ready")
+    print("Gateway timed out")
     return False
 
 
 def stop_gateway():
     """Stop the gateway subprocess."""
-    global _gateway_process, _cookies_tempfile
+    global _gateway_process, _cookies_tempfile, _poll_task
+    
+    if _poll_task:
+        _poll_task.cancel()
+        _poll_task = None
     
     if _gateway_process:
         _gateway_process.terminate()
@@ -181,338 +193,370 @@ def stop_gateway():
         _cookies_tempfile = None
 
 
-# Register cleanup
 atexit.register(stop_gateway)
 
-
-async def gateway_get(path: str, params: dict | None = None, timeout: float = 30.0) -> dict:
-    """Make a GET request to the Instagram gateway."""
-    url = f"{GATEWAY_URL}{path}"
+# Gateway API Helpers
+async def gateway_get(path: str, params: dict | None = None) -> dict:
+    """GET request to gateway."""
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(url, params=params, timeout=timeout)
+            resp = await client.get(f"{GATEWAY_URL}{path}", params=params, timeout=30)
             if resp.status_code >= 400:
-                return {
-                    "ok": False,
-                    "status": resp.status_code,
-                    "error": resp.text,
-                }
+                return {"ok": False, "error": resp.text}
             return {"ok": True, "data": resp.json()}
-        except httpx.TimeoutException:
-            return {"ok": False, "error": "Gateway request timed out"}
-        except httpx.ConnectError:
-            return {"ok": False, "error": f"Could not connect to gateway at {GATEWAY_URL}"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
 
-async def gateway_post(path: str, json_data: dict, timeout: float = 30.0) -> dict:
-    """Make a POST request to the Instagram gateway."""
-    url = f"{GATEWAY_URL}{path}"
+async def gateway_post(path: str, data: dict) -> dict:
+    """POST request to gateway."""
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(url, json=json_data, timeout=timeout)
+            resp = await client.post(f"{GATEWAY_URL}{path}", json=data, timeout=30)
             if resp.status_code >= 400:
-                return {
-                    "ok": False,
-                    "status": resp.status_code,
-                    "error": resp.text,
-                }
-            # Handle 204 No Content
+                return {"ok": False, "error": resp.text}
             if resp.status_code == 204:
-                return {"ok": True, "data": None}
+                return {"ok": True}
             try:
                 return {"ok": True, "data": resp.json()}
             except Exception:
-                return {"ok": True, "data": None}
-        except httpx.TimeoutException:
-            return {"ok": False, "error": "Gateway request timed out"}
-        except httpx.ConnectError:
-            return {"ok": False, "error": f"Could not connect to gateway at {GATEWAY_URL}"}
+                return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
 
-def format_timestamp(ts_ms: int) -> str:
-    """Convert millisecond timestamp to ISO format string."""
-    if not ts_ms:
+# User Resolution
+async def get_user_info(user_id: str) -> dict:
+    """Get username and name for a user ID, with caching."""
+    if user_id in _user_cache:
+        return _user_cache[user_id]
+    
+    result = await gateway_get("/user", {"id": user_id})
+    if result.get("ok"):
+        info = result.get("data", {})
+        _user_cache[user_id] = {
+            "username": info.get("username", ""),
+            "name": info.get("name", ""),
+        }
+        return _user_cache[user_id]
+    
+    return {"username": "", "name": ""}
+
+
+async def resolve_thread_id(identifier: str) -> Optional[str]:
+    """Resolve a username or thread_id to a thread_id."""
+    # If it's already a numeric thread ID, return it
+    if identifier.isdigit():
+        return identifier
+    
+    # Strip @ if present
+    username = identifier.lstrip("@")
+    
+    # Look up user
+    result = await gateway_get("/lookup_user", {"username": username})
+    if result.get("ok"):
+        return result["data"].get("thread_id")
+    
+    return None
+
+
+def format_time_ago(timestamp_ms: int) -> str:
+    """Format timestamp as human-readable 'time ago'."""
+    if not timestamp_ms:
         return ""
+    
+    now = datetime.now(timezone.utc)
+    then = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    diff = now - then
+    
+    if diff.days > 7:
+        return then.strftime("%b %d")
+    elif diff.days > 0:
+        return f"{diff.days}d ago"
+    elif diff.seconds >= 3600:
+        return f"{diff.seconds // 3600}h ago"
+    elif diff.seconds >= 60:
+        return f"{diff.seconds // 60}m ago"
+    else:
+        return "just now"
+
+
+# Internal Actions (not exposed as MCP tools)
+async def _mark_seen(thread_id: str):
+    """Mark thread as seen (internal use)."""
+    if AUTO_MARK_SEEN:
+        await gateway_post("/seen", {"thread_id": thread_id})
+
+
+async def _send_typing(thread_id: str):
+    """Send typing indicator and wait (internal use)."""
+    if SIMULATE_TYPING:
+        await gateway_post("/typing", {"thread_id": thread_id, "typing": True})
+        await asyncio.sleep(TYPING_DELAY_SECONDS)
+        await gateway_post("/typing", {"thread_id": thread_id, "typing": False})
+
+
+async def notify_poke(sender_username: str, sender_name: str, text: str, attachments: list):
+    """Send incoming DM notification to Poke."""
+    if not POKE_API_KEY:
+        return
+    
+    # Format the message nicely
+    sender = f"@{sender_username}" if sender_username else sender_name or "Someone"
+    
+    # Handle attachments
+    if attachments and not text:
+        att_types = [a.get("type", "attachment") for a in attachments]
+        text = f"[sent {', '.join(att_types)}]"
+    
+    message = f"📩 Instagram DM from {sender}: {text}"
+    
     try:
-        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-        return dt.isoformat()
-    except Exception:
-        return ""
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "https://poke.com/api/v1/inbound-sms/webhook",
+                headers={
+                    "Authorization": f"Bearer {POKE_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"message": message},
+                timeout=10,
+            )
+    except Exception as e:
+        print(f"Failed to notify Poke: {e}")
 
 
-# =============================================================================
-# MCP Tools
-# =============================================================================
+async def poll_incoming_messages():
+    """Background task: poll for new DMs and notify Poke."""
+    if not POKE_API_KEY:
+        print("POKE_API_KEY not set - incoming DM notifications disabled")
+        return
+    
+    print("Incoming DM notifications enabled - will forward to Poke")
+    
+    while True:
+        try:
+            result = await gateway_get("/poll", {"max": "50"})
+            if result.get("ok"):
+                events = result.get("data", {}).get("events", [])
+                for event in events:
+                    sender_id = event.get("sender_id", "")
+                    
+                    # Skip our own messages
+                    if sender_id == _self_user_id:
+                        continue
+                    
+                    # Get sender info
+                    user_info = await get_user_info(sender_id)
+                    
+                    await notify_poke(
+                        sender_username=user_info.get("username", ""),
+                        sender_name=user_info.get("name", ""),
+                        text=event.get("text", ""),
+                        attachments=event.get("attachments", []),
+                    )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Poll error: {e}")
+        
+        await asyncio.sleep(2)
 
 
-@mcp.tool(description="Get the current Instagram account info and connection status")
-async def get_account_info() -> dict:
+@mcp.tool(description="Check your Instagram DM inbox - see all conversations and recent messages")
+async def get_inbox() -> dict:
     """
-    Check if the Instagram gateway is connected and get account info.
-    
-    Returns the logged-in username and user ID.
-    """
-    result = await gateway_get("/health")
-    if not result.get("ok"):
-        return {"error": result.get("error", "Failed to connect to gateway")}
-    
-    data = result.get("data", {})
-    return {
-        "status": data.get("status", "unknown"),
-        "username": data.get("username"),
-        "user_id": data.get("user_id"),
-    }
-
-
-@mcp.tool(description="Get your Instagram DM inbox - lists all conversations with recent messages")
-async def get_inbox(limit: int = 20) -> dict:
-    """
-    Get all Instagram DM threads/conversations.
-    
-    Returns a list of conversations with participant info and last message preview.
-    
-    Args:
-        limit: Maximum number of threads to return (default 20)
+    View your Instagram inbox with all conversations.
+    Shows who messaged you, the last message preview, and when.
     """
     result = await gateway_get("/threads")
     if not result.get("ok"):
-        return {"error": result.get("error", "Failed to fetch inbox")}
+        return {"error": result.get("error", "Failed to load inbox")}
     
-    data = result.get("data", {})
-    threads = data.get("threads", [])
+    threads = result.get("data", {}).get("threads", [])
     
-    # Format the threads for easier reading
-    formatted = []
-    for thread in threads[:limit]:
-        formatted.append({
-            "thread_id": thread.get("thread_id"),
-            "participant": {
-                "username": thread.get("participant_username"),
-                "name": thread.get("participant_name"),
-            },
-            "last_message": thread.get("last_message_preview"),
-            "last_message_time": format_timestamp(thread.get("last_message_time", 0)),
-            "message_count": thread.get("message_count", 0),
+    if not threads:
+        return {"message": "Your inbox is empty"}
+    
+    conversations = []
+    for thread in threads[:20]:
+        username = thread.get("participant_username", "")
+        name = thread.get("participant_name", "")
+        
+        # Cache user info
+        thread_id = thread.get("thread_id", "")
+        if thread_id and username:
+            _user_cache[thread_id] = {"username": username, "name": name}
+        
+        display_name = f"@{username}" if username else name or "Unknown"
+        if name and username:
+            display_name = f"@{username} ({name})"
+        
+        conversations.append({
+            "thread_id": thread_id,
+            "user": display_name,
+            "last_message": thread.get("last_message_preview", ""),
+            "time": format_time_ago(thread.get("last_message_time", 0)),
         })
     
     return {
-        "count": len(formatted),
-        "conversations": formatted,
+        "inbox_count": len(conversations),
+        "conversations": conversations,
     }
 
 
-@mcp.tool(description="Get messages from a specific Instagram DM thread")
-async def get_messages(thread_id: str, limit: int = 30) -> dict:
+@mcp.tool(description="Open a conversation to see message history")
+async def get_conversation(user: str, limit: int = 20) -> dict:
     """
-    Get message history from a specific DM thread.
+    View messages in a conversation.
     
     Args:
-        thread_id: The thread ID to fetch messages from
-        limit: Maximum number of messages to return (default 30, max 100)
+        user: Username (like "johndoe" or "@johndoe") or thread_id
+        limit: Number of recent messages to show (default 20)
     """
+    thread_id = await resolve_thread_id(user)
     if not thread_id:
-        return {"error": "thread_id is required"}
+        return {"error": f"Could not find conversation with '{user}'"}
     
-    result = await gateway_get("/history", params={"thread_id": thread_id, "limit": str(min(limit, 100))})
+    # Mark as seen when opening conversation
+    await _mark_seen(thread_id)
+    
+    result = await gateway_get("/history", {"thread_id": thread_id, "limit": str(limit)})
     if not result.get("ok"):
-        return {"error": result.get("error", "Failed to fetch messages")}
+        return {"error": result.get("error", "Failed to load conversation")}
     
     data = result.get("data", {})
-    messages = data.get("messages", [])
+    raw_messages = data.get("messages", [])
     
-    # Format messages
-    formatted = []
-    for msg in messages:
-        formatted.append({
-            "message_id": msg.get("message_id"),
-            "sender_id": msg.get("sender_id"),
-            "text": msg.get("text"),
-            "timestamp": format_timestamp(msg.get("timestamp_ms", 0)),
-            "attachments": [
-                {
-                    "type": att.get("type"),
-                    "url": att.get("url"),
-                    "filename": att.get("filename"),
-                }
-                for att in (msg.get("attachments") or [])
-            ],
+    messages = []
+    for msg in raw_messages:
+        sender_id = msg.get("sender_id", "")
+        
+        # Determine who sent it
+        if sender_id == _self_user_id:
+            sender = "You"
+        else:
+            user_info = await get_user_info(sender_id)
+            username = user_info.get("username", "")
+            sender = f"@{username}" if username else user_info.get("name", "Them")
+        
+        text = msg.get("text", "")
+        attachments = msg.get("attachments", [])
+        
+        # Describe attachments
+        if attachments and not text:
+            att_descs = []
+            for att in attachments:
+                att_type = att.get("type", "")
+                if att_type in ("1", "2", "image"):
+                    att_descs.append("photo")
+                elif att_type in ("3", "4", "video"):
+                    att_descs.append("video")
+                elif att_type == "6" or "audio" in str(att_type).lower():
+                    att_descs.append("voice message")
+                else:
+                    att_descs.append("attachment")
+            text = f"[{', '.join(att_descs)}]"
+        elif attachments:
+            text += " [+attachments]"
+        
+        messages.append({
+            "from": sender,
+            "message": text,
+            "time": format_time_ago(msg.get("timestamp_ms", 0)),
+            "message_id": msg.get("message_id", ""),
         })
     
+    # Get conversation partner name
+    partner_info = _user_cache.get(thread_id, {})
+    partner = f"@{partner_info.get('username', '')}" if partner_info.get("username") else user
+    
     return {
+        "conversation_with": partner,
         "thread_id": thread_id,
-        "count": len(formatted),
+        "message_count": len(messages),
+        "messages": messages,
         "has_more": data.get("has_more", False),
-        "messages": formatted,
     }
 
 
-@mcp.tool(description="Send a text message to an Instagram DM thread")
-async def send_message(thread_id: str, text: str, reply_to: Optional[str] = None) -> dict:
+@mcp.tool(description="Send a message in a conversation")
+async def send_message(user: str, message: str) -> dict:
     """
-    Send a text message to a DM thread.
+    Send a message to someone on Instagram.
     
     Args:
-        thread_id: The thread ID to send the message to
-        text: The message text to send
-        reply_to: Optional message ID to reply to
+        user: Username (like "johndoe" or "@johndoe") or thread_id
+        message: The message to send
     """
+    if not message:
+        return {"error": "Message cannot be empty"}
+    
+    thread_id = await resolve_thread_id(user)
     if not thread_id:
-        return {"error": "thread_id is required"}
-    if not text:
-        return {"error": "text is required"}
+        # Try to start new conversation via dm_username
+        username = user.lstrip("@")
+        result = await gateway_post("/dm_username", {"username": username, "text": message})
+        if result.get("ok"):
+            return {"sent": True, "to": f"@{username}", "message": message}
+        return {"error": f"Could not find or message '{user}'"}
     
-    payload = {"thread_id": thread_id, "text": text}
-    if reply_to:
-        payload["reply_to"] = reply_to
+    # Simulate natural behavior: seen -> typing -> send
+    await _mark_seen(thread_id)
+    await _send_typing(thread_id)
     
-    result = await gateway_post("/send", payload)
+    result = await gateway_post("/send", {"thread_id": thread_id, "text": message})
     if not result.get("ok"):
         return {"error": result.get("error", "Failed to send message")}
     
-    return {"success": True, "message": "Message sent successfully"}
+    # Get recipient name
+    partner_info = _user_cache.get(thread_id, {})
+    recipient = f"@{partner_info.get('username', '')}" if partner_info.get("username") else user
+    
+    return {"sent": True, "to": recipient, "message": message}
 
 
 @mcp.tool(description="React to a message with an emoji")
-async def react_to_message(thread_id: str, message_id: str, emoji: str) -> dict:
+async def react(user: str, emoji: str, message_id: Optional[str] = None) -> dict:
     """
-    Add a reaction to a message.
+    React to a message with an emoji.
     
     Args:
-        thread_id: The thread containing the message
-        message_id: The message ID to react to
-        emoji: The emoji to react with (e.g., "❤️", "😂", "👍")
+        user: Username or thread_id of the conversation
+        emoji: The emoji to react with (like "❤️" or "😂")
+        message_id: Specific message ID to react to (if not provided, reacts to the last message from them)
     """
+    thread_id = await resolve_thread_id(user)
     if not thread_id:
-        return {"error": "thread_id is required"}
+        return {"error": f"Could not find conversation with '{user}'"}
+    
+    # If no message_id provided, get the last message from the other person
     if not message_id:
-        return {"error": "message_id is required"}
-    if not emoji:
-        return {"error": "emoji is required"}
+        result = await gateway_get("/history", {"thread_id": thread_id, "limit": "10"})
+        if not result.get("ok"):
+            return {"error": "Could not load conversation to find message"}
+        
+        messages = result.get("data", {}).get("messages", [])
+        # Find last message NOT from us
+        for msg in reversed(messages):
+            if msg.get("sender_id") != _self_user_id:
+                message_id = msg.get("message_id")
+                break
+        
+        if not message_id:
+            return {"error": "No message found to react to"}
     
     result = await gateway_post("/react", {
         "thread_id": thread_id,
         "message_id": message_id,
         "emoji": emoji,
     })
-    if not result.get("ok"):
-        return {"error": result.get("error", "Failed to add reaction")}
-    
-    return {"success": True, "message": f"Reacted with {emoji}"}
-
-
-@mcp.tool(description="Search for an Instagram user by username")
-async def search_user(username: str) -> dict:
-    """
-    Look up an Instagram user by their username.
-    
-    Returns the user's ID which can be used to start a DM.
-    
-    Args:
-        username: The Instagram username to search for (without @)
-    """
-    if not username:
-        return {"error": "username is required"}
-    
-    # Strip @ if present
-    username = username.lstrip("@")
-    
-    result = await gateway_get("/lookup_user", params={"username": username})
-    if not result.get("ok"):
-        return {"error": result.get("error", f"User @{username} not found")}
-    
-    data = result.get("data", {})
-    return {
-        "username": data.get("username"),
-        "user_id": data.get("user_id"),
-        "thread_id": data.get("thread_id"),  # Same as user_id for 1:1 DMs
-    }
-
-
-@mcp.tool(description="Send a DM to a user by their username (starts new conversation if needed)")
-async def send_dm(username: str, text: str) -> dict:
-    """
-    Send a direct message to a user by their username.
-    
-    This will create a new conversation thread if one doesn't exist.
-    
-    Args:
-        username: The Instagram username to message (without @)
-        text: The message text to send
-    """
-    if not username:
-        return {"error": "username is required"}
-    if not text:
-        return {"error": "text is required"}
-    
-    # Strip @ if present
-    username = username.lstrip("@")
-    
-    result = await gateway_post("/dm_username", {
-        "username": username,
-        "text": text,
-    }, timeout=60.0)  # Longer timeout since it needs to search first
     
     if not result.get("ok"):
-        return {"error": result.get("error", f"Failed to send DM to @{username}")}
+        return {"error": result.get("error", "Failed to react")}
     
-    data = result.get("data", {})
-    return {
-        "success": True,
-        "message": f"Message sent to @{username}",
-        "thread_id": data.get("thread_id"),
-        "user_id": data.get("user_id"),
-    }
+    return {"reacted": True, "emoji": emoji}
 
-
-@mcp.tool(description="Mark a conversation as read/seen")
-async def mark_as_read(thread_id: str) -> dict:
-    """
-    Mark a DM thread as read.
-    
-    Args:
-        thread_id: The thread ID to mark as read
-    """
-    if not thread_id:
-        return {"error": "thread_id is required"}
-    
-    result = await gateway_post("/seen", {"thread_id": thread_id})
-    if not result.get("ok"):
-        return {"error": result.get("error", "Failed to mark as read")}
-    
-    return {"success": True, "message": "Marked as read"}
-
-
-@mcp.tool(description="Get user info by their user ID")
-async def get_user_info(user_id: str) -> dict:
-    """
-    Get information about a user by their ID.
-    
-    Args:
-        user_id: The Instagram user ID
-    """
-    if not user_id:
-        return {"error": "user_id is required"}
-    
-    result = await gateway_get("/user", params={"id": user_id})
-    if not result.get("ok"):
-        return {"error": result.get("error", "User not found")}
-    
-    data = result.get("data", {})
-    return {
-        "user_id": data.get("id"),
-        "username": data.get("username"),
-        "name": data.get("name"),
-        "profile_pic_url": data.get("profile_pic_url"),
-    }
-
-
-# =============================================================================
-# Main Entry Point
-# =============================================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
@@ -522,16 +566,13 @@ if __name__ == "__main__":
     print("Instagram DMs MCP Server")
     print("=" * 50)
     
-    # Start the gateway
     if not start_gateway():
-        print("\nFailed to start gateway. Exiting.")
+        print("\nFailed to start. Check your cookies.")
         sys.exit(1)
     
-    print(f"\nStarting MCP server on {host}:{port}")
-    print(f"MCP endpoint: http://{host}:{port}/mcp")
+    print(f"\nMCP server: http://{host}:{port}/mcp")
     print("=" * 50)
     
-    # Handle signals for clean shutdown
     def handle_signal(signum, frame):
         print("\nShutting down...")
         stop_gateway()
@@ -539,6 +580,21 @@ if __name__ == "__main__":
     
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+    
+    # Start the Poke notification polling in background
+    async def start_with_polling():
+        global _poll_task
+        loop = asyncio.get_event_loop()
+        _poll_task = loop.create_task(poll_incoming_messages())
+    
+    # Note: FastMCP will run its own event loop, so we start polling there
+    import threading
+    def run_polling():
+        asyncio.run(poll_incoming_messages())
+    
+    if POKE_API_KEY:
+        polling_thread = threading.Thread(target=run_polling, daemon=True)
+        polling_thread.start()
     
     mcp.run(
         transport="http",

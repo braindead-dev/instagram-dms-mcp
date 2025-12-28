@@ -8,7 +8,7 @@ A Model Context Protocol (MCP) server that lets AI assistants read and send Inst
 
 1. Go to [instagram.com](https://www.instagram.com) and log in
 2. Open DevTools (F12) → **Application** tab → **Cookies** → `https://www.instagram.com`
-3. Copy these cookie values:
+3. Copy these values into your `.env`:
 
 | Cookie | Env Variable |
 |--------|--------------|
@@ -28,32 +28,58 @@ cd instagram-dms-mcp
 # Build the gateway (requires Go 1.22+)
 cd gateway && ./build.sh && cd ..
 
-# Copy and fill in your cookies
+# Configure
 cp env.example .env
-# Edit .env with your cookie values
-```
+# Edit .env with your cookies
 
-### 3. Run
-
-```bash
+# Run
 pip install -r requirements.txt
 python src/server.py
 ```
 
-The MCP server will be available at `http://localhost:8000/mcp`
-
-## Connecting to Poke
-
-1. Go to [poke.com/settings/connections](https://poke.com/settings/connections)
-2. Add a new MCP integration  
-3. Enter your MCP server URL
-
-## Available Tools
+## Tools
 
 | Tool | Description |
 |------|-------------|
-| `get_inbox` | List all DM conversations |
-| `get_messages` | Get messages from a thread |
-| `send_message` | Send a message |
-| `send_dm` | DM a user by username |
-| `react_to_message` | React with an emoji |
+| `get_inbox()` | See all your conversations |
+| `get_conversation(user)` | Read messages with someone |
+| `send_message(user, message)` | Send a message |
+| `react(user, emoji)` | React to their last message |
+
+### Example Flow
+
+```
+User: "Check my Instagram DMs"
+→ get_inbox()
+
+User: "What did @johndoe say?"
+→ get_conversation("johndoe")
+
+User: "Reply with 'sounds good!'"
+→ send_message("johndoe", "sounds good!")
+
+User: "React with a heart"
+→ react("johndoe", "❤️")
+```
+
+## Incoming DM Notifications (Poke)
+
+To get notified when you receive new DMs:
+
+1. Get your API key from [poke.com/settings/advanced](https://poke.com/settings/advanced)
+2. Add to `.env`:
+   ```
+   POKE_API_KEY=your_key_here
+   ```
+
+New DMs will be forwarded to Poke as: `📩 Instagram DM from @username: message`
+
+## Behavior Settings
+
+The MCP simulates natural behavior by default:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `IG_SIMULATE_TYPING` | `true` | Show typing indicator before sending |
+| `IG_AUTO_MARK_SEEN` | `true` | Mark as read when opening conversation |
+| `IG_TYPING_DELAY` | `1.5` | Seconds to "type" before sending |
