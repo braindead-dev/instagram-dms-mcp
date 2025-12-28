@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: instagram-dms-mcp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python src/server.py
+    plan: free
+    autoDeploy: false
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: IG_GATEWAY_ADDR
+        sync: false
