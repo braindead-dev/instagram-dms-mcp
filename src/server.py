@@ -2,13 +2,23 @@
 """
 Instagram DMs MCP Server
 
-A Model Context Protocol server that provides Instagram DM capabilities
-via integration with a Go-based Instagram gateway.
+A Model Context Protocol server that provides Instagram DM capabilities.
+Automatically manages the Instagram gateway as a subprocess.
 """
 
+import asyncio
+import atexit
+import base64
+import json
 import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from pathlib import Path
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -17,9 +27,162 @@ from fastmcp import FastMCP
 load_dotenv()
 
 # Gateway configuration
-GATEWAY_URL = os.getenv("IG_GATEWAY_ADDR", "http://127.0.0.1:29391").rstrip("/")
+GATEWAY_PORT = 29391
+GATEWAY_URL = f"http://127.0.0.1:{GATEWAY_PORT}"
+
+# Global gateway process
+_gateway_process: Optional[subprocess.Popen] = None
+_cookies_tempfile: Optional[str] = None
 
 mcp = FastMCP("instagram-dms-mcp")
+
+
+def get_cookies_json() -> Optional[str]:
+    """Get cookies JSON from environment variables."""
+    # Try individual env vars first (preferred method)
+    session_id = os.getenv("IG_SESSION_ID", "")
+    user_id = os.getenv("IG_USER_ID", "")
+    csrf_token = os.getenv("IG_CSRF_TOKEN", "")
+    
+    if session_id and user_id and csrf_token:
+        cookies = {
+            "sessionid": session_id,
+            "ds_user_id": user_id,
+            "csrftoken": csrf_token,
+        }
+        # Add optional cookies if present
+        if os.getenv("IG_DATR"):
+            cookies["datr"] = os.getenv("IG_DATR")
+        if os.getenv("IG_DID"):
+            cookies["ig_did"] = os.getenv("IG_DID")
+        if os.getenv("IG_MID"):
+            cookies["mid"] = os.getenv("IG_MID")
+        return json.dumps(cookies)
+    
+    # Fallback: try IG_COOKIES as JSON or base64
+    cookies_raw = os.getenv("IG_COOKIES", "")
+    if cookies_raw:
+        # Try to decode as base64 first
+        try:
+            decoded = base64.b64decode(cookies_raw).decode("utf-8")
+            json.loads(decoded)  # Verify it's valid JSON
+            return decoded
+        except Exception:
+            pass
+        
+        # Try as raw JSON
+        try:
+            json.loads(cookies_raw)
+            return cookies_raw
+        except Exception:
+            pass
+    
+    return None
+
+
+def find_gateway_binary() -> Optional[Path]:
+    """Find the gateway binary relative to this script."""
+    script_dir = Path(__file__).parent.parent
+    candidates = [
+        script_dir / "gateway" / "ig-gateway",
+        script_dir / "gateway" / "ig-gateway.exe",
+        Path("gateway") / "ig-gateway",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def start_gateway() -> bool:
+    """Start the Instagram gateway as a subprocess."""
+    global _gateway_process, _cookies_tempfile
+    
+    # Check if already running
+    try:
+        resp = httpx.get(f"{GATEWAY_URL}/health", timeout=2)
+        if resp.status_code == 200:
+            print("Gateway already running")
+            return True
+    except Exception:
+        pass
+    
+    # Get cookies
+    cookies_json = get_cookies_json()
+    if not cookies_json:
+        print("ERROR: Instagram cookies not set")
+        print("Set these environment variables in your .env file:")
+        print("  IG_SESSION_ID=...")
+        print("  IG_USER_ID=...")
+        print("  IG_CSRF_TOKEN=...")
+        print("\nSee env.example for the full list")
+        return False
+    
+    # Write cookies to temp file
+    fd, _cookies_tempfile = tempfile.mkstemp(suffix=".json", prefix="ig_cookies_")
+    with os.fdopen(fd, "w") as f:
+        f.write(cookies_json)
+    
+    # Find gateway binary
+    gateway_bin = find_gateway_binary()
+    if not gateway_bin:
+        print("ERROR: Gateway binary not found. Run 'cd gateway && ./build.sh' first")
+        return False
+    
+    # Start gateway
+    print(f"Starting Instagram gateway...")
+    env = os.environ.copy()
+    env["IG_COOKIES_FILE"] = _cookies_tempfile
+    
+    _gateway_process = subprocess.Popen(
+        [str(gateway_bin)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    
+    # Wait for gateway to be ready
+    for i in range(30):
+        try:
+            resp = httpx.get(f"{GATEWAY_URL}/health", timeout=2)
+            if resp.status_code == 200:
+                data = resp.json()
+                print(f"Gateway ready - logged in as @{data.get('username', 'unknown')}")
+                return True
+        except Exception:
+            pass
+        
+        # Check if process died
+        if _gateway_process.poll() is not None:
+            stdout, _ = _gateway_process.communicate()
+            print(f"Gateway failed to start:\n{stdout.decode()}")
+            return False
+        
+        time.sleep(1)
+    
+    print("Gateway timed out waiting for ready")
+    return False
+
+
+def stop_gateway():
+    """Stop the gateway subprocess."""
+    global _gateway_process, _cookies_tempfile
+    
+    if _gateway_process:
+        _gateway_process.terminate()
+        try:
+            _gateway_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _gateway_process.kill()
+        _gateway_process = None
+    
+    if _cookies_tempfile and os.path.exists(_cookies_tempfile):
+        os.unlink(_cookies_tempfile)
+        _cookies_tempfile = None
+
+
+# Register cleanup
+atexit.register(stop_gateway)
 
 
 async def gateway_get(path: str, params: dict | None = None, timeout: float = 30.0) -> dict:
@@ -355,8 +518,27 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     host = "0.0.0.0"
     
-    print(f"Starting Instagram DMs MCP server on {host}:{port}")
-    print(f"Gateway URL: {GATEWAY_URL}")
+    print("=" * 50)
+    print("Instagram DMs MCP Server")
+    print("=" * 50)
+    
+    # Start the gateway
+    if not start_gateway():
+        print("\nFailed to start gateway. Exiting.")
+        sys.exit(1)
+    
+    print(f"\nStarting MCP server on {host}:{port}")
+    print(f"MCP endpoint: http://{host}:{port}/mcp")
+    print("=" * 50)
+    
+    # Handle signals for clean shutdown
+    def handle_signal(signum, frame):
+        print("\nShutting down...")
+        stop_gateway()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
     
     mcp.run(
         transport="http",
