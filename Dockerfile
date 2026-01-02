@@ -1,5 +1,5 @@
 # build Go gateway
-FROM golang:1.21-alpine AS go-builder
+FROM golang:1.25-alpine AS go-builder
 
 WORKDIR /app/gateway
 COPY gateway/go.mod gateway/go.sum ./
