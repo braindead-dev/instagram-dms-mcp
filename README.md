@@ -2,6 +2,20 @@
 
 A Model Context Protocol (MCP) server that lets AI assistants read and send Instagram DMs.
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/braindead-dev/instagram-dms-mcp)
+
+## Deployment
+
+### Option 1: One-Click Deploy (Render)
+
+1. Click the "Deploy to Render" button above
+2. Add your environment variables in Render dashboard:
+   - `IG_COOKIES` - Your Instagram cookies as JSON (see below)
+   - `POKE_API_KEY` - Your Poke API key (optional, for DM notifications)
+3. Your MCP server will be at `https://your-service.onrender.com/mcp`
+
+### Option 2: Local Development
+
 ## Quick Start
 
 ### 1. Get Your Instagram Cookies
