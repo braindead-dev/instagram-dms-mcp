@@ -382,7 +382,7 @@ async def flush_pending_messages(thread_id: str):
     if len(messages) == 1:
         # Single message format
         msg = messages[0]
-        text = msg["text"] or format_attachment_text(msg["attachments"]) if msg["attachments"] else ""
+        text = msg["text"] or (format_attachment_text(msg["attachments"]) if msg["attachments"] else "")
         poke_message = f"Instagram DM from {sender} [thread:{thread_id}, message:{msg['message_id']}]: {text}"
     else:
         # Multiple messages format
