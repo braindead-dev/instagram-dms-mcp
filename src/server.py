@@ -68,6 +68,7 @@ TYPING_DELAY_SECONDS = float(os.getenv("IG_TYPING_DELAY", "1.5"))
 
 # Poke webhook for incoming DM notifications
 POKE_API_KEY = os.getenv("POKE_API_KEY", "")
+DEBOUNCE_SECONDS = float(os.getenv("IG_DEBOUNCE_SECONDS", "3"))
 
 # Global state
 _gateway_process: Optional[subprocess.Popen] = None
@@ -78,6 +79,12 @@ _self_username: Optional[str] = None
 
 # User cache: user_id -> {username, name}
 _user_cache: dict[str, dict] = {}
+
+# Debounce state for Poke notifications
+# thread_id -> list of pending messages
+_pending_messages: dict[str, list] = {}
+# thread_id -> debounce task
+_debounce_tasks: dict[str, asyncio.Task] = {}
 
 mcp = FastMCP("instagram-dms-mcp")
 
@@ -327,38 +334,72 @@ async def _send_typing(thread_id: str):
         await gateway_post("/typing", {"thread_id": thread_id, "typing": False})
 
 
-async def notify_poke(sender_username: str, sender_name: str, thread_id: str, text: str, attachments: list):
-    """Send incoming DM notification to Poke."""
-    if not POKE_API_KEY:
+def format_attachment_text(attachments: list) -> str:
+    """Convert attachments to descriptive text."""
+    att_types = []
+    for a in attachments:
+        att_type = a.get("type", "")
+        if att_type in ("1", "2", "image"):
+            att_types.append("photo")
+        elif att_type in ("3", "4", "video"):
+            att_types.append("video")
+        elif att_type == "6" or "audio" in str(att_type).lower():
+            att_types.append("voice message")
+        else:
+            att_types.append("attachment")
+    return f"[sent {', '.join(att_types)}]"
+
+
+def format_sender(username: str, name: str) -> str:
+    """Format sender display string."""
+    if username and name:
+        return f"@{username} ({name})"
+    elif username:
+        return f"@{username}"
+    elif name:
+        return name
+    return "Someone"
+
+
+async def flush_pending_messages(thread_id: str):
+    """Send all pending messages for a thread to Poke."""
+    global _pending_messages, _debounce_tasks
+    
+    if thread_id not in _pending_messages or not _pending_messages[thread_id]:
         return
     
-    # Format sender: @username (Display Name)
-    if sender_username and sender_name:
-        sender = f"@{sender_username} ({sender_name})"
-    elif sender_username:
-        sender = f"@{sender_username}"
-    elif sender_name:
-        sender = sender_name
+    messages = _pending_messages.pop(thread_id, [])
+    _debounce_tasks.pop(thread_id, None)
+    
+    if not messages:
+        return
+    
+    # Get sender info from first message
+    first_msg = messages[0]
+    sender = format_sender(first_msg["username"], first_msg["name"])
+    
+    # Format message based on count
+    if len(messages) == 1:
+        # Single message format
+        msg = messages[0]
+        text = msg["text"] or format_attachment_text(msg["attachments"]) if msg["attachments"] else ""
+        poke_message = f"Instagram DM from {sender} [thread:{thread_id}, message:{msg['message_id']}]: {text}"
     else:
-        sender = "Someone"
-    
-    # Handle attachments
-    if attachments and not text:
-        att_types = []
-        for a in attachments:
-            att_type = a.get("type", "")
-            if att_type in ("1", "2", "image"):
-                att_types.append("photo")
-            elif att_type in ("3", "4", "video"):
-                att_types.append("video")
-            elif att_type == "6" or "audio" in str(att_type).lower():
-                att_types.append("voice message")
+        # Multiple messages format
+        lines = [f"Instagram DMs from {sender} [thread:{thread_id}]:"]
+        now = time.time() * 1000
+        for msg in messages:
+            text = msg["text"] or (format_attachment_text(msg["attachments"]) if msg["attachments"] else "")
+            age_ms = now - msg["timestamp"]
+            age_sec = int(age_ms / 1000)
+            if age_sec < 60:
+                age_str = f"{age_sec}s ago"
             else:
-                att_types.append("attachment")
-        text = f"[sent {', '.join(att_types)}]"
+                age_str = f"{age_sec // 60}m ago"
+            lines.append(f"[message:{msg['message_id']}, {age_str}] {text}")
+        poke_message = "\n".join(lines)
     
-    message = f"Instagram DM from {sender} [thread:{thread_id}]: {text}"
-    
+    # Send to Poke
     try:
         async with httpx.AsyncClient() as client:
             await client.post(
@@ -367,21 +408,62 @@ async def notify_poke(sender_username: str, sender_name: str, thread_id: str, te
                     "Authorization": f"Bearer {POKE_API_KEY}",
                     "Content-Type": "application/json",
                 },
-                json={"message": message},
+                json={"message": poke_message},
                 timeout=10,
             )
-        log("poke", f"Forwarded DM to Poke", {"from": sender, "thread": thread_id})
+        log("poke", f"Forwarded {len(messages)} message(s) to Poke", {"from": sender, "thread": thread_id})
+        print(f"\033[95m         → {poke_message}\033[0m")
     except Exception as e:
         log("error", f"Failed to notify Poke: {e}")
 
 
+async def debounce_flush(thread_id: str):
+    """Wait for debounce period then flush messages."""
+    await asyncio.sleep(DEBOUNCE_SECONDS)
+    await flush_pending_messages(thread_id)
+
+
+async def queue_message_for_poke(thread_id: str, message_id: str, username: str, name: str, text: str, attachments: list, timestamp: int):
+    """Add a message to the pending queue and manage debounce timer."""
+    global _pending_messages, _debounce_tasks
+    
+    if not POKE_API_KEY:
+        return
+    
+    # Add to pending messages
+    if thread_id not in _pending_messages:
+        _pending_messages[thread_id] = []
+    
+    _pending_messages[thread_id].append({
+        "message_id": message_id,
+        "username": username,
+        "name": name,
+        "text": text,
+        "attachments": attachments,
+        "timestamp": timestamp,
+    })
+    
+    log("incoming", f"New DM from @{username or 'unknown'}", {
+        "thread": thread_id,
+        "queued": len(_pending_messages[thread_id]),
+    })
+    print(f"\033[94m         ← {text or '[attachment]'}\033[0m")
+    
+    # Cancel existing debounce timer for this thread
+    if thread_id in _debounce_tasks:
+        _debounce_tasks[thread_id].cancel()
+    
+    # Start new debounce timer
+    _debounce_tasks[thread_id] = asyncio.create_task(debounce_flush(thread_id))
+
+
 async def poll_incoming_messages():
-    """Background task: poll for new DMs and notify Poke."""
+    """Background task: poll for new DMs and queue for Poke with debouncing."""
     if not POKE_API_KEY:
         print("POKE_API_KEY not set - incoming DM notifications disabled")
         return
     
-    print("Incoming DM notifications enabled - will forward to Poke")
+    print(f"Incoming DM notifications enabled (debounce: {DEBOUNCE_SECONDS}s)")
     
     while True:
         try:
@@ -399,19 +481,16 @@ async def poll_incoming_messages():
                     
                     # Get sender info
                     user_info = await get_user_info(sender_id)
-                    username = user_info.get("username", "")
                     
-                    log("incoming", f"New DM from @{username or sender_id}", {
-                        "thread": thread_id,
-                        "message": event.get("text", "")[:50] + ("..." if len(event.get("text", "")) > 50 else "")
-                    })
-                    
-                    await notify_poke(
-                        sender_username=user_info.get("username", ""),
-                        sender_name=user_info.get("name", ""),
+                    # Queue for debounced sending to Poke
+                    await queue_message_for_poke(
                         thread_id=thread_id,
+                        message_id=event.get("message_id", ""),
+                        username=user_info.get("username", ""),
+                        name=user_info.get("name", ""),
                         text=event.get("text", ""),
                         attachments=event.get("attachments", []),
+                        timestamp=event.get("timestamp_ms", int(time.time() * 1000)),
                     )
         except asyncio.CancelledError:
             break
@@ -558,9 +637,11 @@ async def send_message(user: str, message: str) -> dict:
     if not thread_id:
         # Try to start new conversation via dm_username
         username = user.lstrip("@")
-        result = await gateway_post("/dm_username", {"username": username, "text": message})
+        payload = {"username": username, "text": message}
+        result = await gateway_post("/dm_username", payload)
         if result.get("ok"):
             log("outgoing", f"Sent DM to @{username} (new conversation)")
+            print(f"\033[92m         → POST /dm_username {payload}\033[0m")
             return {"sent": True, "to": f"@{username}", "message": message}
         return {"error": f"Could not find or message '{user}'"}
     
@@ -568,7 +649,8 @@ async def send_message(user: str, message: str) -> dict:
     await _mark_seen(thread_id)
     await _send_typing(thread_id)
     
-    result = await gateway_post("/send", {"thread_id": thread_id, "text": message})
+    payload = {"thread_id": thread_id, "text": message}
+    result = await gateway_post("/send", payload)
     if not result.get("ok"):
         return {"error": result.get("error", "Failed to send message")}
     
@@ -577,6 +659,7 @@ async def send_message(user: str, message: str) -> dict:
     recipient = f"@{partner_info.get('username', '')}" if partner_info.get("username") else user
     
     log("outgoing", f"Sent message to {recipient}", {"thread": thread_id})
+    print(f"\033[92m         → POST /send {payload}\033[0m")
     return {"sent": True, "to": recipient, "message": message}
 
 
@@ -611,16 +694,18 @@ async def react(user: str, emoji: str, message_id: Optional[str] = None) -> dict
         if not message_id:
             return {"error": "No message found to react to"}
     
-    result = await gateway_post("/react", {
+    payload = {
         "thread_id": thread_id,
         "message_id": message_id,
         "emoji": emoji,
-    })
+    }
+    result = await gateway_post("/react", payload)
     
     if not result.get("ok"):
         return {"error": result.get("error", "Failed to react")}
     
     log("outgoing", f"Reacted with {emoji} to message in {user}")
+    print(f"\033[92m         → POST /react {payload}\033[0m")
     return {"reacted": True, "emoji": emoji}
 
 
